@@ -82,6 +82,9 @@ var (
 			RunAsUser: extensionsv1beta1.RunAsUserStrategyOptions{
 				Rule: extensionsv1beta1.RunAsUserStrategyMustRunAsNonRoot,
 			},
+			RunAsGroup: extensionsv1beta1.RunAsGroupStrategyOptions{
+				Rule: extensionsv1beta1.RunAsGroupStrategyMustRunAsNonRoot,
+			},
 			SELinux: extensionsv1beta1.SELinuxStrategyOptions{
 				Rule: extensionsv1beta1.SELinuxStrategyRunAsAny,
 			},
