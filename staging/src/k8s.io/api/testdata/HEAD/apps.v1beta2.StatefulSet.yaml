@@ -1061,6 +1061,7 @@ spec:
           volumePath: "103"
   updateStrategy:
     rollingUpdate:
+      maxUnavailable: 2
       partition: 804652982
     type: Ä嚕uʟ膠ĉ班康%m忣àÂƺ琰Ȃ
   volumeClaimTemplates:

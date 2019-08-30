@@ -803,6 +803,12 @@ const (
 	//
 	// Enables Leader Migration for kube-controller-manager and cloud-controller-manager
 	ControllerManagerLeaderMigration featuregate.Feature = "ControllerManagerLeaderMigration"
+
+	// owner: @krmayankk
+	// alpha: v1.22
+	//
+	// Enables maxUnavailable for StatefulSet
+	MaxUnavailableStatefulSet featuregate.Feature = "MaxUnavailableStatefulSet"
 )
 
 func init() {
@@ -922,6 +928,7 @@ var defaultKubernetesFeatureGates = map[featuregate.Feature]featuregate.FeatureS
 	MemoryQoS:                                      {Default: false, PreRelease: featuregate.Alpha},
 	CPUManagerPolicyOptions:                        {Default: false, PreRelease: featuregate.Alpha},
 	ControllerManagerLeaderMigration:               {Default: true, PreRelease: featuregate.Beta},
+	MaxUnavailableStatefulSet:                      {Default: false, PreRelease: featuregate.Alpha},
 
 	// inherited features from generic apiserver, relisted here to get a conflict if it is changed
 	// unintentionally on either side:
