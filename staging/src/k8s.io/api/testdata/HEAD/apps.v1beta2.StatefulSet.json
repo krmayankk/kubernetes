@@ -1569,7 +1569,8 @@
     "updateStrategy": {
       "type": "șa汸\u003cƋlɋN磋镮ȺPÈ",
       "rollingUpdate": {
-        "partition": -83826225
+        "partition": 86666826,
+        "maxUnavailable": 2
       }
     },
     "revisionHistoryLimit": -1872519086

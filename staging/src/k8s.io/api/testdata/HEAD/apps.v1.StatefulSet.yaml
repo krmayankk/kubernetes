@@ -1008,8 +1008,9 @@ spec:
           volumePath: "101"
   updateStrategy:
     rollingUpdate:
-      partition: -83826225
-    type: șa汸<ƋlɋN磋镮ȺPÈ
+      maxUnavailable: 2
+      partition: 86666826
+    type: ǲ讱ȕ齐疅檎ǽ曖sƖTƫ
   volumeClaimTemplates:
   - metadata:
       annotations:

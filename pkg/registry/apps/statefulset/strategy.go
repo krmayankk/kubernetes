@@ -64,6 +64,19 @@ func (statefulSetStrategy) NamespaceScoped() bool {
 	return true
 }
 
+// dropStatefulSetDisabledFields drops fields that are not used if their associated feature gates
+// are not enabled.  The typical pattern is:
+//     if !utilfeature.DefaultFeatureGate.Enabled(features.MyFeature) && !myFeatureInUse(oldSvc) {
+//         newSvc.Spec.MyFeature = nil
+//     }
+func dropStatefulSetDisabledFields(newStatefulSet *apps.StatefulSet, oldStatefulSet *apps.StatefulSet) {
+	if !utilfeature.DefaultFeatureGate.Enabled(features.MaxUnavailableStatefulSet) && !maxUnavailableInUse(oldStatefulSet) {
+		if newStatefulSet.Spec.UpdateStrategy.RollingUpdate != nil {
+			newStatefulSet.Spec.UpdateStrategy.RollingUpdate.MaxUnavailable = nil
+		}
+	}
+}
+
 // PrepareForCreate clears the status of an StatefulSet before creation.
 func (statefulSetStrategy) PrepareForCreate(ctx context.Context, obj runtime.Object) {
 	statefulSet := obj.(*apps.StatefulSet)
@@ -73,6 +86,20 @@ func (statefulSetStrategy) PrepareForCreate(ctx context.Context, obj runtime.Obj
 	statefulSet.Generation = 1
 
 	pod.DropDisabledTemplateFields(&statefulSet.Spec.Template, nil)
+	dropStatefulSetDisabledFields(statefulSet, nil)
+}
+
+// maxUnavailableInUse returns true if StatefulSet's maxUnavailable set(used)
+func maxUnavailableInUse(statefulset *apps.StatefulSet) bool {
+	if statefulset == nil {
+		return false
+	}
+	if statefulset.Spec.UpdateStrategy.RollingUpdate != nil {
+		if statefulset.Spec.UpdateStrategy.RollingUpdate.MaxUnavailable != nil {
+			return true
+		}
+	}
+	return false
 }
 
 // PrepareForUpdate clears fields that are not allowed to be set by end users on update.
@@ -83,6 +110,8 @@ func (statefulSetStrategy) PrepareForUpdate(ctx context.Context, obj, old runtim
 	newStatefulSet.Status = oldStatefulSet.Status
 
 	pod.DropDisabledTemplateFields(&newStatefulSet.Spec.Template, &oldStatefulSet.Spec.Template)
+
+	dropStatefulSetDisabledFields(newStatefulSet, oldStatefulSet)
 
 	// Any changes to the spec increment the generation number, any changes to the
 	// status should reflect the generation number of the corresponding object.

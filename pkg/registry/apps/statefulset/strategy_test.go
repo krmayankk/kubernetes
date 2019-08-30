@@ -17,13 +17,19 @@ limitations under the License.
 package statefulset
 
 import (
+	"reflect"
 	"testing"
 
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/util/diff"
+	"k8s.io/apimachinery/pkg/util/intstr"
 	genericapirequest "k8s.io/apiserver/pkg/endpoints/request"
 	"k8s.io/apiserver/pkg/registry/rest"
+	utilfeature "k8s.io/apiserver/pkg/util/feature"
+	featuregatetesting "k8s.io/component-base/featuregate/testing"
 	"k8s.io/kubernetes/pkg/apis/apps"
 	api "k8s.io/kubernetes/pkg/apis/core"
+	"k8s.io/kubernetes/pkg/features"
 )
 
 func TestStatefulSetStrategy(t *testing.T) {
@@ -203,4 +209,82 @@ func TestStatefulSetStatusStrategy(t *testing.T) {
 	if len(errs) != 0 {
 		t.Errorf("unexpected error %v", errs)
 	}
+}
+
+func makeStatefulSetWithMaxUnavailable(maxUnavailable *int) *apps.StatefulSet {
+	rollingUpdate := apps.RollingUpdateStatefulSetStrategy{}
+	if maxUnavailable != nil {
+		maxUnavailableIntStr := intstr.FromInt(*maxUnavailable)
+		rollingUpdate = apps.RollingUpdateStatefulSetStrategy{
+			MaxUnavailable: &maxUnavailableIntStr,
+		}
+	}
+
+	return &apps.StatefulSet{
+		Spec: apps.StatefulSetSpec{
+			UpdateStrategy: apps.StatefulSetUpdateStrategy{
+				Type:          apps.RollingUpdateStatefulSetStrategyType,
+				RollingUpdate: &rollingUpdate,
+			},
+		},
+	}
+}
+
+func TestDropDisabledField(t *testing.T) {
+	maxUnavailable := 3
+	testCases := []struct {
+		name                 string
+		enableMaxUnavailable bool
+		sts                  *apps.StatefulSet
+		oldSts               *apps.StatefulSet
+		expectedSts          *apps.StatefulSet
+	}{
+		{
+			name:                 "MaxUnavailable not enabled, field not used",
+			enableMaxUnavailable: false,
+			sts:                  makeStatefulSetWithMaxUnavailable(nil),
+			oldSts:               nil,
+			expectedSts:          makeStatefulSetWithMaxUnavailable(nil),
+		},
+		{
+			name:                 "MaxUnavailable not enabled, field used in new, not in old",
+			enableMaxUnavailable: false,
+			sts:                  makeStatefulSetWithMaxUnavailable(&maxUnavailable),
+			oldSts:               nil,
+			expectedSts:          makeStatefulSetWithMaxUnavailable(nil),
+		},
+		{
+			name:                 "MaxUnavailable not enabled, field used in old and new",
+			enableMaxUnavailable: false,
+			sts:                  makeStatefulSetWithMaxUnavailable(&maxUnavailable),
+			oldSts:               makeStatefulSetWithMaxUnavailable(&maxUnavailable),
+			expectedSts:          makeStatefulSetWithMaxUnavailable(&maxUnavailable),
+		},
+		{
+			name:                 "MaxUnavailable enabled, field used",
+			enableMaxUnavailable: true,
+			sts:                  makeStatefulSetWithMaxUnavailable(&maxUnavailable),
+			oldSts:               nil,
+			expectedSts:          makeStatefulSetWithMaxUnavailable(&maxUnavailable),
+		},
+
+		/* add more tests for other dropped fields as needed */
+	}
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			defer featuregatetesting.SetFeatureGateDuringTest(t, utilfeature.DefaultFeatureGate, features.MaxUnavailableStatefulSet, tc.enableMaxUnavailable)()
+			old := tc.oldSts.DeepCopy()
+			dropStatefulSetDisabledFields(tc.sts, tc.oldSts)
+
+			// old node  should never be changed
+			if !reflect.DeepEqual(tc.oldSts, old) {
+				t.Errorf("%v: old statefulset changed: %v", tc.name, diff.ObjectReflectDiff(tc.oldSts, old))
+			}
+
+			if !reflect.DeepEqual(tc.sts, tc.expectedSts) {
+				t.Errorf("%v: unexpected statefulset spec: %v", tc.name, diff.ObjectReflectDiff(tc.sts, tc.expectedSts))
+			}
+		})
+	}
+
 }
