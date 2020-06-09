@@ -23,6 +23,7 @@ import (
 	v1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	utilerrors "k8s.io/apimachinery/pkg/util/errors"
+	intstrutil "k8s.io/apimachinery/pkg/util/intstr"
 	"k8s.io/client-go/tools/record"
 	"k8s.io/klog/v2"
 	"k8s.io/kubernetes/pkg/controller/history"
@@ -512,9 +513,20 @@ func (ssc *defaultStatefulSetControl) updateStatefulSet(
 
 	// we compute the minimum ordinal of the target sequence for a destructive update based on the strategy.
 	updateMin := 0
+	maxUnavailable := 1
 	if set.Spec.UpdateStrategy.RollingUpdate != nil {
 		updateMin = int(*set.Spec.UpdateStrategy.RollingUpdate.Partition)
+		maxUnavailable, err = intstrutil.GetValueFromIntOrPercent(intstrutil.ValueOrDefault(set.Spec.UpdateStrategy.RollingUpdate.MaxUnavailable, intstrutil.FromInt(1)), int(replicaCount), false)
+		if err != nil {
+			return &status, err
+		}
+		// maxUnavailable should not less than 1
+		if maxUnavailable < 1 {
+			maxUnavailable = 1
+		}
 	}
+
+	var unavailablePods []string
 	// we terminate the Pod with the largest ordinal that does not match the update revision.
 	for target := len(replicas) - 1; target >= updateMin; target-- {
 
@@ -524,21 +536,31 @@ func (ssc *defaultStatefulSetControl) updateStatefulSet(
 				set.Namespace,
 				set.Name,
 				replicas[target].Name)
-			err := ssc.podControl.DeleteStatefulPod(set, replicas[target])
+			if err := ssc.podControl.DeleteStatefulPod(set, replicas[target]); err != nil {
+				return nil, err
+			}
+			// After deleting a Pod, dont return from here yet.
+			// We might have maxUnavailable greater than 1.
 			status.CurrentReplicas--
-			return &status, err
 		}
 
-		// wait for unhealthy Pods on update
-		if !isHealthy(replicas[target]) {
+		if getPodRevision(replicas[target]) != updateRevision.Name || !isHealthy(replicas[target]) {
+			unavailablePods = append(unavailablePods, replicas[target].Name)
+
+		}
+
+		// If at anytime, total number of unavailable Pods exceeds maxUnavailable,
+		// we stop deleting more Pods for Update
+		if len(unavailablePods) >= maxUnavailable {
 			klog.V(4).Infof(
-				"StatefulSet %s/%s is waiting for Pod %s to update",
+				"StatefulSet %s/%s is waiting for pods to become available. (Currently unavailable: %v, maxUnavailable: %v)",
 				set.Namespace,
 				set.Name,
-				replicas[target].Name)
+				unavailablePods,
+				maxUnavailable)
 			return &status, nil
-		}
 
+		}
 	}
 	return &status, nil
 }

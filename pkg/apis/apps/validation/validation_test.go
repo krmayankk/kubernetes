@@ -138,8 +138,8 @@ func TestValidateStatefulSet(t *testing.T) {
 					Type: apps.RollingUpdateStatefulSetStrategyType,
 					RollingUpdate: func() *apps.RollingUpdateStatefulSetStrategy {
 						return &apps.RollingUpdateStatefulSetStrategy{Partition: 2, MaxUnavailable: func() *intstr.IntOrString {
-							zeroNum := intstr.FromInt(2)
-							return &zeroNum
+							numberTwo := intstr.FromInt(2)
+							return &numberTwo
 						}()}
 					}()},
 			},

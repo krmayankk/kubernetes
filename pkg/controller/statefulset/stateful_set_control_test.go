@@ -34,6 +34,8 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/labels"
 	utilerrors "k8s.io/apimachinery/pkg/util/errors"
+	"k8s.io/apimachinery/pkg/util/intstr"
+	utilfeature "k8s.io/apiserver/pkg/util/feature"
 	"k8s.io/client-go/informers"
 	appsinformers "k8s.io/client-go/informers/apps/v1"
 	coreinformers "k8s.io/client-go/informers/core/v1"
@@ -43,9 +45,11 @@ import (
 	corelisters "k8s.io/client-go/listers/core/v1"
 	"k8s.io/client-go/tools/cache"
 	"k8s.io/client-go/tools/record"
+	featuregatetesting "k8s.io/component-base/featuregate/testing"
 	podutil "k8s.io/kubernetes/pkg/api/v1/pod"
 	"k8s.io/kubernetes/pkg/controller"
 	"k8s.io/kubernetes/pkg/controller/history"
+	"k8s.io/kubernetes/pkg/features"
 )
 
 type invariantFunc func(set *apps.StatefulSet, spc *fakeStatefulPodControl) error
@@ -604,6 +608,255 @@ func TestStatefulSetControl_getSetRevisions(t *testing.T) {
 	}
 	for i := range tests {
 		testFn(&tests[i], t)
+	}
+}
+
+func TestStatefulSetControlRollingUpdateWithMaxUnavailableInOrderedMode(t *testing.T) {
+	defer featuregatetesting.SetFeatureGateDuringTest(t, utilfeature.DefaultFeatureGate, features.MaxUnavailableStatefulSet, true)()
+
+	set := newStatefulSet(6)
+	var partition int32 = 3
+	var maxUnavailable = intstr.FromInt(2)
+	set.Spec.UpdateStrategy = apps.StatefulSetUpdateStrategy{
+		Type: apps.RollingUpdateStatefulSetStrategyType,
+		RollingUpdate: func() *apps.RollingUpdateStatefulSetStrategy {
+			return &apps.RollingUpdateStatefulSetStrategy{
+				Partition:      &partition,
+				MaxUnavailable: &maxUnavailable,
+			}
+		}(),
+	}
+
+	client := fake.NewSimpleClientset()
+	spc, _, ssc, stop := setupController(client)
+	defer close(stop)
+	if err := scaleUpStatefulSetControl(set, ssc, spc, assertBurstInvariants); err != nil {
+		t.Fatal(err)
+	}
+	set, err := spc.setsLister.StatefulSets(set.Namespace).Get(set.Name)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// start to update
+	set.Spec.Template.Spec.Containers[0].Image = "foo"
+
+	selector, err := metav1.LabelSelectorAsSelector(set.Spec.Selector)
+	if err != nil {
+		t.Fatal(err)
+	}
+	originalPods, err := spc.podsLister.Pods(set.Namespace).List(selector)
+	if err != nil {
+		t.Fatal(err)
+	}
+	sort.Sort(ascendingOrdinal(originalPods))
+
+	// first update pods 4/5, this will delete 4/5, since maxUnavailable is 2
+	if err = ssc.UpdateStatefulSet(set, originalPods); err != nil {
+		t.Fatal(err)
+	}
+	pods, err := spc.podsLister.Pods(set.Namespace).List(selector)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	sort.Sort(ascendingOrdinal(pods))
+
+	// expected number of pod is 0,1,2,3
+	if !reflect.DeepEqual(pods, originalPods[:4]) {
+		t.Fatalf("Expected pods %v, got pods %v", originalPods[:4], pods)
+	}
+
+	// create new pods 5(only one pod gets created at a time due to OrderedReady)
+	if err = ssc.UpdateStatefulSet(set, pods); err != nil {
+		t.Fatal(err)
+	}
+	pods, err = spc.podsLister.Pods(set.Namespace).List(selector)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if len(pods) != 5 {
+		t.Fatalf("Expected create pods 5, got pods %v", len(pods))
+	}
+	spc.setPodRunning(set, 4)
+	pods, _ = spc.setPodReady(set, 4)
+
+	// create new pods 4(only one pod gets created at a time due to OrderedReady)
+	if err = ssc.UpdateStatefulSet(set, pods); err != nil {
+		t.Fatal(err)
+	}
+	pods, err = spc.podsLister.Pods(set.Namespace).List(selector)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if len(pods) != 6 {
+		t.Fatalf("Expected create pods 4, got pods %v", len(pods))
+	}
+
+	// if pod 4 ready, start to update pod 3
+	spc.setPodRunning(set, 5)
+	originalPods, _ = spc.setPodReady(set, 5)
+	sort.Sort(ascendingOrdinal(originalPods))
+	if err = ssc.UpdateStatefulSet(set, originalPods); err != nil {
+		t.Fatal(err)
+	}
+	pods, err = spc.podsLister.Pods(set.Namespace).List(selector)
+	if err != nil {
+		t.Fatal(err)
+	}
+	sort.Sort(ascendingOrdinal(pods))
+
+	// verify the remaining pods are 0,1,2,4,5 (3 got deleted)
+	if !reflect.DeepEqual(pods, append(originalPods[:3], originalPods[4:]...)) {
+		t.Fatalf("Expected pods %v, got pods %v", append(originalPods[:3], originalPods[4:]...), pods)
+	}
+
+	// create new pod 3
+	if err = ssc.UpdateStatefulSet(set, pods); err != nil {
+		t.Fatal(err)
+	}
+	pods, err = spc.podsLister.Pods(set.Namespace).List(selector)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(pods) != 6 {
+		t.Fatalf("Expected create pods 2/3, got pods %v", pods)
+	}
+
+	// pods 3/4/5 ready, should not update other pods
+	spc.setPodRunning(set, 3)
+	spc.setPodRunning(set, 5)
+	spc.setPodReady(set, 5)
+	originalPods, _ = spc.setPodReady(set, 3)
+	sort.Sort(ascendingOrdinal(originalPods))
+	if err = ssc.UpdateStatefulSet(set, originalPods); err != nil {
+		t.Fatal(err)
+	}
+	pods, err = spc.podsLister.Pods(set.Namespace).List(selector)
+	if err != nil {
+		t.Fatal(err)
+	}
+	sort.Sort(ascendingOrdinal(pods))
+	if !reflect.DeepEqual(pods, originalPods) {
+		t.Fatalf("Expected pods %v, got pods %v", originalPods, pods)
+	}
+}
+
+func TestStatefulSetControlRollingUpdateWithMaxUnavailableInBurstMode(t *testing.T) {
+	defer featuregatetesting.SetFeatureGateDuringTest(t, utilfeature.DefaultFeatureGate, features.MaxUnavailableStatefulSet, true)()
+
+	set := burst(newStatefulSet(6))
+	var partition int32 = 3
+	var maxUnavailable = intstr.FromInt(2)
+	set.Spec.UpdateStrategy = apps.StatefulSetUpdateStrategy{
+		Type: apps.RollingUpdateStatefulSetStrategyType,
+		RollingUpdate: func() *apps.RollingUpdateStatefulSetStrategy {
+			return &apps.RollingUpdateStatefulSetStrategy{
+				Partition:      &partition,
+				MaxUnavailable: &maxUnavailable,
+			}
+		}(),
+	}
+
+	client := fake.NewSimpleClientset()
+	spc, _, ssc, stop := setupController(client)
+	defer close(stop)
+	if err := scaleUpStatefulSetControl(set, ssc, spc, assertBurstInvariants); err != nil {
+		t.Fatal(err)
+	}
+	set, err := spc.setsLister.StatefulSets(set.Namespace).Get(set.Name)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// start to update
+	set.Spec.Template.Spec.Containers[0].Image = "foo"
+
+	selector, err := metav1.LabelSelectorAsSelector(set.Spec.Selector)
+	if err != nil {
+		t.Fatal(err)
+	}
+	originalPods, err := spc.podsLister.Pods(set.Namespace).List(selector)
+	if err != nil {
+		t.Fatal(err)
+	}
+	sort.Sort(ascendingOrdinal(originalPods))
+
+	// first update pods 4/5 (both 4 and 5 will get deleted since maxUnavailable is 2)
+	if err = ssc.UpdateStatefulSet(set, originalPods); err != nil {
+		t.Fatal(err)
+	}
+	pods, err := spc.podsLister.Pods(set.Namespace).List(selector)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	sort.Sort(ascendingOrdinal(pods))
+	// verify only 4 pods are remaining(0,1,2,3)
+	if !reflect.DeepEqual(pods, originalPods[:4]) {
+		t.Fatalf("Expected pods %v, got pods %v", originalPods[:4], pods)
+	}
+
+	// create new pods 4/5 (this assumes bursting)
+	if err = ssc.UpdateStatefulSet(set, pods); err != nil {
+		t.Fatal(err)
+	}
+	pods, err = spc.podsLister.Pods(set.Namespace).List(selector)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if len(pods) != 6 {
+		t.Fatalf("Expected create pods 4/5, got pods %v", len(pods))
+	}
+
+	// if pod 4 ready, start to update pod 3
+	spc.setPodRunning(set, 4)
+	spc.setPodRunning(set, 5)
+	originalPods, _ = spc.setPodReady(set, 4)
+	sort.Sort(ascendingOrdinal(originalPods))
+	if err = ssc.UpdateStatefulSet(set, originalPods); err != nil {
+		t.Fatal(err)
+	}
+	pods, err = spc.podsLister.Pods(set.Namespace).List(selector)
+	if err != nil {
+		t.Fatal(err)
+	}
+	sort.Sort(ascendingOrdinal(pods))
+	if !reflect.DeepEqual(pods, append(originalPods[:3], originalPods[4:]...)) {
+		t.Fatalf("Expected pods %v, got pods %v", append(originalPods[:3], originalPods[4:]...), pods)
+	}
+
+	// create new pod 3
+	if err = ssc.UpdateStatefulSet(set, pods); err != nil {
+		t.Fatal(err)
+	}
+	pods, err = spc.podsLister.Pods(set.Namespace).List(selector)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(pods) != 6 {
+		t.Fatalf("Expected create pods 2/3, got pods %v", pods)
+	}
+
+	// pods 3/4/5 ready, should not update other pods
+	spc.setPodRunning(set, 3)
+	spc.setPodRunning(set, 5)
+	spc.setPodReady(set, 5)
+	originalPods, _ = spc.setPodReady(set, 3)
+	sort.Sort(ascendingOrdinal(originalPods))
+	if err = ssc.UpdateStatefulSet(set, originalPods); err != nil {
+		t.Fatal(err)
+	}
+	pods, err = spc.podsLister.Pods(set.Namespace).List(selector)
+	if err != nil {
+		t.Fatal(err)
+	}
+	sort.Sort(ascendingOrdinal(pods))
+	if !reflect.DeepEqual(pods, originalPods) {
+		t.Fatalf("Expected pods %v, got pods %v", originalPods, pods)
 	}
 }
 
